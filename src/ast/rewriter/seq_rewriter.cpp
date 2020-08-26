@@ -3262,6 +3262,16 @@ br_status seq_rewriter::mk_str_in_regexp(expr* a, expr* b, expr_ref& result) {
             re().mk_in_re(a, b1));
         return BR_REWRITE_FULL;
     }
+    expr_ref ite_of_s(m());
+    if (is_ite_of_to_re_leaves(b, ite_of_s)) {
+        result = m_br.mk_eq_rw(a, ite_of_s);
+        return BR_REWRITE_FULL;
+    }
+    expr* b2 = nullptr, * s1 = nullptr, * s2 = nullptr;
+    if (re().is_concat(b, b1, b2) && re().is_to_re(b1, s1) && re().is_to_re(b2, s2)) {
+        result = re().mk_to_re(str().mk_concat(s1, s2));
+        return BR_REWRITE_FULL;
+    }
     if (str().is_empty(a)) {
         result = is_nullable(b);
         if (str().is_in_re(result))
@@ -3336,6 +3346,23 @@ bool seq_rewriter::has_fixed_length_constraint(expr* a, unsigned& len) {
     unsigned minl = re().min_length(a), maxl = re().max_length(a);
     len = minl;
     return minl == maxl;
+}
+
+bool seq_rewriter::is_ite_of_to_re_leaves(expr* ite_of_r, expr_ref& ite_of_s)
+{
+    expr* s = nullptr, * cond = nullptr, * th_r = nullptr, * el_r = nullptr;
+    expr_ref th_s(m());
+    expr_ref el_s(m());
+    if (re().is_to_re(ite_of_r, s)) {
+        ite_of_s = s;
+        return true;
+    }
+    if (m().is_ite(ite_of_r, cond, th_r, el_r) &&
+        is_ite_of_to_re_leaves(th_r, th_s) && is_ite_of_to_re_leaves(el_r, el_s)) {
+        ite_of_s = m().mk_ite(cond, th_s, el_s);
+        return true;
+    }
+    return false;
 }
 
 br_status seq_rewriter::mk_str_to_regexp(expr* a, expr_ref& result) {
