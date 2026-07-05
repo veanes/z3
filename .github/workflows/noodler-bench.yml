@@ -1,0 +1,74 @@
+name: noodler-bench
+
+# Compare VeriFIT/z3-noodler against our c3-split-marker z3 (stock seq / nseq / monadic
+# diagnostic) on the multivariable regex-membership benchmark suite, on one Ubuntu runner.
+# Manual dispatch, or push to the noodler-bench branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout:
+        description: "per-benchmark timeout (seconds)"
+        default: "20"
+  push:
+    branches: [noodler-bench]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      NOODLER_TAG: v1.6.1
+      NOODLER_ASSET: z3-noodler-ubuntu-24.04-x86_64-static-libz3
+      BENCH_TIMEOUT: ${{ github.event.inputs.timeout || '20' }}
+    steps:
+      - name: Checkout (our z3 source + benchmarks)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ python3
+
+      - name: Build our z3 (Release; nseq + monadic diagnostic compiled in)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          ninja -C build shell
+          ./build/z3 --version
+
+      - name: Download z3-noodler release binary
+        run: |
+          set -x
+          curl -fL -o z3-noodler \
+            "https://github.com/VeriFIT/z3-noodler/releases/download/${NOODLER_TAG}/${NOODLER_ASSET}"
+          chmod +x z3-noodler
+          file z3-noodler || true
+          ldd z3-noodler || true
+          ./z3-noodler --version
+
+      - name: Run benchmark suite (noodler / seq / nseq / monadic)
+        run: |
+          python3 noodler_bench/run_bench.py 2>&1 | tee noodler_bench/run.log
+        env:
+          Z3_BIN: ./build/z3
+          NOODLER_BIN: ./z3-noodler
+          OUT_CSV: noodler_bench/results.csv
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== rows ==="; wc -l noodler_bench/results.csv || true
+          echo "=== tail ==="; tail -n 5 noodler_bench/results.csv || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: noodler-bench-results
+          path: |
+            noodler_bench/results.csv
+            noodler_bench/run.log
+          if-no-files-found: warn
