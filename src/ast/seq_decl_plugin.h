@@ -454,6 +454,26 @@ public:
             bool classical { true };
 
             /*
+              Approximate semilinear (ultimately periodic) abstraction of the length set
+              Lambda(r) = { |w| : w in L(r) }. The soundness contract is the containment
+
+                  Lambda(r)  subseteq  { n : min_length <= n <= max_length, (n mod period) in residues }
+
+              where period is in [1, max_period] and bit i of residues (for i < period) records that
+              length residue i is possible. The trivial abstraction period = 1, residues = 1 constrains
+              nothing, and is the default so that every existing construction site stays sound.
+
+              Only the containment above is required, so any rule may safely weaken the abstraction:
+              a rewrite can cost precision, never correctness. Complement therefore degrades to top.
+
+              This is what makes e.g. (ab)* & a(ba)* refutable: the first has period 2 residues {0},
+              the second period 2 residues {1}, so the intersection has an empty residue set.
+            */
+            static constexpr unsigned max_period = 64;
+            unsigned period { 1 };
+            uint64_t residues { 1 };
+
+            /*
               Default constructor of invalid info.
             */
             info() = default;
@@ -492,6 +512,32 @@ public:
             bool is_valid() const { return known != l_undef; }
 
             bool is_known() const { return known == l_true; }
+
+            /*
+              True when the length abstraction is empty, which certifies that L(r) is empty.
+              Returns false for unknown info.
+            */
+            bool length_is_empty() const;
+
+            /*
+              Over-approximates the residues of Lambda modulo q, as a bitmask over [0, q).
+              Handles both projection (q divides period) and lifting (period divides q),
+              and enumerates exactly when the length range is short and finite.
+            */
+            uint64_t residues_mod(unsigned q) const;
+
+            /*
+              The gcd of the abstracted length set; 0 when that set is empty or is exactly {0}.
+              Used by star/plus/loop, since every sum of elements is a multiple of the gcd.
+            */
+            unsigned length_gcd() const;
+
+            /*
+              Period to use when combining with another info. A set with at most one element is
+              congruent to that element modulo *any* period, so it adapts to the other operand;
+              0 signals "adaptable" and composes correctly under gcd and lcm.
+            */
+            unsigned eff_period() const { return min_length == max_length ? 0 : period; }
 
             info star() const;
             info plus() const;

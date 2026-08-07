@@ -1758,13 +1758,123 @@ std::ostream& seq_util::rex::info::display(std::ostream& out) const {
             << "nullable=" << (nullable == l_true ? "T" : (nullable == l_false ? "F" : "U")) << ", "
             << "min_length=" << min_length << ", "
             << "max_length=" << max_length << ", "
-            << "classical=" << (classical ? "T" : "F") << ")";
+            << "classical=" << (classical ? "T" : "F");
+        if (period > 1) {
+            out << ", lengths=";
+            bool first = true;
+            for (unsigned r = 0; r < period; ++r)
+                if (residues & (1ull << r)) {
+                    out << (first ? "" : "|") << r;
+                    first = false;
+                }
+            if (first)
+                out << "{}";
+            out << " mod " << period;
+        }
+        out << ")";
     }
     else if (is_valid())
         out << "UNKNOWN";
     else
         out << "INVALID";
     return out;
+}
+
+/*
+  Helpers for the semilinear length abstraction.
+*/
+static unsigned sl_gcd(unsigned a, unsigned b) {
+    while (b) { unsigned t = a % b; a = b; b = t; }
+    return a;
+}
+
+/* All residues modulo q. */
+static uint64_t sl_full(unsigned q) {
+    return q >= seq_util::rex::info::max_period ? ~0ull : ((1ull << q) - 1);
+}
+
+/*
+  Least common multiple of two effective periods, treating 0 as "adaptable" (identity).
+  Returns 0 when the result would exceed max_period, signalling that the caller must degrade.
+*/
+static unsigned sl_lcm(unsigned a, unsigned b) {
+    if (a == 0) return b;
+    if (b == 0) return a;
+    uint64_t l = (uint64_t)(a / sl_gcd(a, b)) * b;
+    return l > seq_util::rex::info::max_period ? 0 : (unsigned)l;
+}
+
+/*
+  A common modulus for combining two infos: the lcm when it stays within max_period,
+  otherwise the gcd. Both are sound: residues_mod over-approximates for either.
+*/
+static unsigned sl_common(unsigned a, unsigned b) {
+    unsigned q = sl_lcm(a, b);
+    if (q == 0) q = sl_gcd(a, b);
+    return q == 0 ? 1 : q;
+}
+
+bool seq_util::rex::info::length_is_empty() const {
+    if (!is_known())
+        return false;
+    if (min_length > max_length || residues == 0)
+        return true;
+    if (period <= 1)
+        return false;
+    // A window spanning at least one full period necessarily meets some residue.
+    if (max_length == UINT_MAX || max_length - min_length >= period - 1)
+        return false;
+    for (unsigned n = min_length; n <= max_length; ++n)
+        if (residues & (1ull << (n % period)))
+            return false;
+    return true;
+}
+
+uint64_t seq_util::rex::info::residues_mod(unsigned q) const {
+    if (q == 0 || length_is_empty())
+        return 0;
+    if (q >= max_period)
+        return sl_full(q);
+    uint64_t res = 0;
+    // Exact when the length range is short and finite; this also covers the singleton case.
+    if (max_length != UINT_MAX && max_length - min_length < max_period) {
+        for (unsigned n = min_length; n <= max_length; ++n)
+            if (residues & (1ull << (n % period)))
+                res |= 1ull << (n % q);
+        return res;
+    }
+    if (q <= period && period % q == 0) {
+        for (unsigned r = 0; r < period; ++r)
+            if (residues & (1ull << r))
+                res |= 1ull << (r % q);
+        return res;
+    }
+    if (q > period && q % period == 0) {
+        for (unsigned r = 0; r < period; ++r)
+            if (residues & (1ull << r))
+                for (unsigned t = r; t < q; t += period)
+                    res |= 1ull << t;
+        return res;
+    }
+    return sl_full(q);
+}
+
+unsigned seq_util::rex::info::length_gcd() const {
+    if (length_is_empty())
+        return 0;
+    unsigned g = 0;
+    // Scanning two full periods past the minimum suffices to expose the gcd of the set.
+    unsigned span = (period > (UINT_MAX - min_length) / 2) ? UINT_MAX : min_length + 2 * period;
+    unsigned hi = std::min(max_length, span);
+    for (unsigned n = min_length; n <= hi; ++n) {
+        if (residues & (1ull << (n % period)))
+            g = sl_gcd(g, n);
+        if (g == 1)
+            return 1;
+    }
+    if (max_length == UINT_MAX)
+        g = sl_gcd(g, period);
+    return g;
 }
 
 /*
@@ -1778,13 +1888,26 @@ std::string seq_util::rex::info::str() const {
 
 seq_util::rex::info seq_util::rex::info::star() const {
     //if is_known() is false then all mentioned properties will remain false
-    return seq_util::rex::info(interpreted, l_true, 0, max_length == 0 ? 0 : UINT_MAX, classical);
+    info r(interpreted, l_true, 0, max_length == 0 ? 0 : UINT_MAX, classical);
+    // Every word of r* is a concatenation of words of r, so its length is a multiple of gcd(Lambda).
+    unsigned g = length_gcd();
+    if (g > 1 && g <= max_period) {
+        r.period = g;
+        r.residues = 1;
+    }
+    return r;
 }
 
 seq_util::rex::info seq_util::rex::info::plus() const {
     if (is_known()) {
         //plus never occurs in a normalized regex
-        return info(interpreted, nullable, min_length, max_length == 0 ? 0 : UINT_MAX, classical);
+        info r(interpreted, nullable, min_length, max_length == 0 ? 0 : UINT_MAX, classical);
+        unsigned g = length_gcd();
+        if (g > 1 && g <= max_period) {
+            r.period = g;
+            r.residues = 1;
+        }
+        return r;
     }
     else
         return *this;
@@ -1793,13 +1916,18 @@ seq_util::rex::info seq_util::rex::info::plus() const {
 seq_util::rex::info seq_util::rex::info::opt() const {
     // if is_known() is false then all mentioned properties will remain false
     // optional construct never occurs in a normalized regex
-    return seq_util::rex::info(interpreted, l_true, 0, max_length, classical);
+    info r(interpreted, l_true, 0, max_length, classical);
+    // Lambda(r?) = Lambda(r) union {0}
+    r.period = period;
+    r.residues = residues | 1ull;
+    return r;
 }
 
 seq_util::rex::info seq_util::rex::info::complement() const {
     if (is_known()) {
         lbool compl_nullable = (nullable == l_true ? l_false : (nullable == l_false ? l_true : l_undef));
         unsigned compl_min_length = (compl_nullable == l_false ? 1 : 0);
+        // The length set of a complement is not determined by that of the argument: degrade to top.
         return info(interpreted, compl_nullable, compl_min_length, UINT_MAX, false);
     }
     else
@@ -1814,11 +1942,26 @@ seq_util::rex::info seq_util::rex::info::concat(seq_util::rex::info const& rhs, 
                 is_nullable = l_true;
             if (nullable == l_false || rhs.nullable == l_false)
                 is_nullable = l_false;
-            return info(interpreted && rhs.interpreted,
+            info r(interpreted && rhs.interpreted,
                 is_nullable,
                 add_truncate(min_length, rhs.min_length),
                 add_truncate(max_length, rhs.max_length),
                 classical && rhs.classical);
+            // Lengths add, so residues add modulo the gcd of the two periods.
+            unsigned g = sl_gcd(eff_period(), rhs.eff_period());
+            if (g > 1) {
+                uint64_t a = residues_mod(g), b = rhs.residues_mod(g), res = 0;
+                for (unsigned i = 0; i < g; ++i) {
+                    if (!(a & (1ull << i)))
+                        continue;
+                    for (unsigned j = 0; j < g; ++j)
+                        if (b & (1ull << j))
+                            res |= 1ull << ((i + j) % g);
+                }
+                r.period = g;
+                r.residues = res;
+            }
+            return r;
         }
         else
             return rhs;
@@ -1830,11 +1973,18 @@ seq_util::rex::info seq_util::rex::info::concat(seq_util::rex::info const& rhs, 
 seq_util::rex::info seq_util::rex::info::disj(seq_util::rex::info const& rhs) const {
     if (is_known() || rhs.is_known()) {
         //works correctly if one of the arguments is unknown
-        return info(interpreted && rhs.interpreted,
+        info r(interpreted && rhs.interpreted,
             ((nullable == l_true || rhs.nullable == l_true) ? l_true : ((nullable == l_false && rhs.nullable == l_false) ? l_false : l_undef)),
             std::min(min_length, rhs.min_length),
             std::max(max_length, rhs.max_length),
             classical && rhs.classical);
+        // Lambda(r|s) = Lambda(r) union Lambda(s)
+        unsigned q = sl_common(eff_period(), rhs.eff_period());
+        if (q > 1) {
+            r.period = q;
+            r.residues = residues_mod(q) | rhs.residues_mod(q);
+        }
+        return r;
     }
     else
         return rhs;
@@ -1843,11 +1993,18 @@ seq_util::rex::info seq_util::rex::info::disj(seq_util::rex::info const& rhs) co
 seq_util::rex::info seq_util::rex::info::conj(seq_util::rex::info const& rhs) const {
     if (is_known()) {
         if (rhs.is_known()) {
-            return info(interpreted && rhs.interpreted,
+            info r(interpreted && rhs.interpreted,
                 ((nullable == l_true && rhs.nullable == l_true) ? l_true : ((nullable == l_false || rhs.nullable == l_false) ? l_false : l_undef)),
                 std::max(min_length, rhs.min_length),
                 std::min(max_length, rhs.max_length),
                 false);
+            // Lambda(r&s) is contained in Lambda(r) intersect Lambda(s), which is the sound direction.
+            unsigned q = sl_common(eff_period(), rhs.eff_period());
+            if (q > 1) {
+                r.period = q;
+                r.residues = residues_mod(q) & rhs.residues_mod(q);
+            }
+            return r;
         }
         else
             return rhs;
@@ -1859,11 +2016,15 @@ seq_util::rex::info seq_util::rex::info::conj(seq_util::rex::info const& rhs) co
 seq_util::rex::info seq_util::rex::info::diff(seq_util::rex::info const& rhs) const {
     if (is_known()) {
         if (rhs.is_known()) {
-            return info(interpreted & rhs.interpreted,
+            info r(interpreted & rhs.interpreted,
                 ((nullable == l_true && rhs.nullable == l_false) ? l_true : ((nullable == l_false || rhs.nullable == l_false) ? l_false : l_undef)),
                 min_length,
                 max_length,
                 false);
+            // Lambda(r \ s) is contained in Lambda(r), so the lhs abstraction carries over.
+            r.period = period;
+            r.residues = residues;
+            return r;
         }
         else
             return rhs;
@@ -1879,11 +2040,18 @@ seq_util::rex::info seq_util::rex::info::xor_(seq_util::rex::info const& rhs) co
             lbool xor_nullable = l_undef;
             if (nullable != l_undef && rhs.nullable != l_undef)
                 xor_nullable = (nullable == rhs.nullable) ? l_false : l_true;
-            return info(interpreted & rhs.interpreted,
+            info r(interpreted & rhs.interpreted,
                 xor_nullable,
                 0,
                 UINT_MAX,
                 false);
+            // Lambda(r xor s) is contained in Lambda(r) union Lambda(s).
+            unsigned q = sl_common(eff_period(), rhs.eff_period());
+            if (q > 1) {
+                r.period = q;
+                r.residues = residues_mod(q) | rhs.residues_mod(q);
+            }
+            return r;
         }
         else
             return rhs;
@@ -1898,11 +2066,18 @@ seq_util::rex::info seq_util::rex::info::orelse(seq_util::rex::info const& i) co
             // unsigned ite_min_length = std::min(min_length, i.min_length);
             // lbool ite_nullable = (nullable == i.nullable ? nullable : l_undef);
             // TBD: whether ite is interpreted or not depends on whether the condition is interpreted and both branches are interpreted
-            return info(false,
+            info r(false,
                 ((nullable == l_true && i.nullable == l_true) ? l_true : ((nullable == l_false && i.nullable == l_false) ? l_false : l_undef)),
                 std::min(min_length, i.min_length),
                 std::max(max_length, i.max_length),
                 classical && i.classical);
+            // The ite denotes one of the two branches, so its lengths lie in the union.
+            unsigned q = sl_common(eff_period(), i.eff_period());
+            if (q > 1) {
+                r.period = q;
+                r.residues = residues_mod(q) | i.residues_mod(q);
+            }
+            return r;
         }
         else
             return i;
@@ -1916,7 +2091,38 @@ seq_util::rex::info seq_util::rex::info::loop(unsigned lower, unsigned upper) co
         unsigned m = mul_truncate(min_length, lower);
         unsigned max_l = mul_truncate(max_length, upper);
         lbool loop_nullable = (nullable == l_true || lower == 0 ? l_true : nullable);
-        return info(interpreted, loop_nullable, m, max_l, classical);
+        info r(interpreted, loop_nullable, m, max_l, classical);
+        if (upper == UINT_MAX || upper > max_period) {
+            // Unbounded (or very wide) repetition: every element is a multiple of the gcd.
+            unsigned g = length_gcd();
+            if (g > 1 && g <= max_period) {
+                r.period = g;
+                r.residues = 1;
+            }
+        }
+        else if (period > 1 || min_length == max_length) {
+            // Bounded repetition: union of the k-fold sumsets of the residues, lower <= k <= upper.
+            unsigned q = (period > 1) ? period : 1;
+            uint64_t base = residues_mod(q), acc = 0, cur = 1ull /* k = 0 */;
+            for (unsigned k = 0; k <= upper; ++k) {
+                if (k >= lower)
+                    acc |= cur;
+                uint64_t next = 0;
+                for (unsigned i = 0; i < q; ++i) {
+                    if (!(cur & (1ull << i)))
+                        continue;
+                    for (unsigned j = 0; j < q; ++j)
+                        if (base & (1ull << j))
+                            next |= 1ull << ((i + j) % q);
+                }
+                cur = next;
+            }
+            if (q > 1) {
+                r.period = q;
+                r.residues = acc;
+            }
+        }
+        return r;
     }
     else
         return *this;
@@ -1933,5 +2139,7 @@ seq_util::rex::info& seq_util::rex::info::operator=(info const& other) {
     min_length = other.min_length;
     max_length = other.max_length;
     classical = other.classical;
+    period = other.period;
+    residues = other.residues;
     return *this;
 }
